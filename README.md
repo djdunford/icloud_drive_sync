@@ -14,12 +14,15 @@ repository to select the version from `.nvmrc`.
 
 1. In the [Google Cloud Console](https://console.cloud.google.com/), create a
    project, enable the Google Drive API, configure the OAuth consent screen, and
-   create an OAuth client ID for a **Desktop app**. If the consent screen is in
-   testing mode, add your Google account as a test user.
+   create an OAuth client ID for a **Desktop app**. Declare `drive.file` as the
+   Drive scope. If the consent screen is in testing mode, add your Google
+   account as a test user.
 2. Download the OAuth client JSON and save it as `credentials.json` in this
    repository, or set `GOOGLE_DRIVE_CREDENTIALS` to its path. Do not commit this
-   file. Google will ask you to grant the utility access to your Drive so it can
-   find the destination folder and avoid duplicate uploads.
+   file. The utility requests the `drive.file` scope, which limits access to
+   files it creates or that you explicitly select for it. This scope still
+   allows modifying accessible files; this script only creates files and reads
+   metadata, and does not update or delete them.
 3. From WSL, install dependencies and build:
 
    ```sh
@@ -44,5 +47,19 @@ npm run upload -- /mnt/e/Users/djdun/Pictures
 On the first run, a browser window opens for Google authorization. The refresh
 token is stored at `~/.config/icloud-drive-sync/google-drive-token.json` (or
 `GOOGLE_DRIVE_TOKEN` if set). The utility finds or creates `Pictures` at the
-Drive root. It uploads sequentially; if any files fail, it reports them and
-exits with a non-zero status.
+Drive root. With `drive.file`, it may not see a `Pictures` folder created
+outside this utility, and could create a second folder with that name. It
+uploads sequentially and prints a per-file progress count.
+
+If you previously authorized the utility with full Drive access, revoke its
+access in your Google Account, delete the saved token file, then run it again.
+The utility rejects a saved token that does not confirm the limited `drive.file`
+scope.
+
+After each uploaded or skipped file, progress is saved to a checkpoint under
+`~/.config/icloud-drive-sync/` (or the path in `GOOGLE_DRIVE_STATE`). If a run
+is interrupted, run the same command again to resume; completed files are
+skipped, while an unfinished file is checked in Drive and uploaded if it is not
+there. The checkpoint tracks source files by relative path, size, and
+modification time. If any files fail, the utility reports them and exits with a
+non-zero status.

@@ -1,12 +1,14 @@
 import { authenticate } from "@google-cloud/local-auth";
-import { chmod, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { google, type drive_v3 } from "googleapis";
 import type { Credentials, OAuth2Client } from "google-auth-library";
 
-const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"];
+const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const DRIVE_SCOPES = [DRIVE_FILE_SCOPE];
 const DEFAULT_SOURCE = "/mnt/e/Users/djdun/Pictures";
 const DEFAULT_CREDENTIALS = path.resolve("credentials.json");
 const DEFAULT_TOKEN = path.join(
@@ -15,7 +17,26 @@ const DEFAULT_TOKEN = path.join(
   "icloud-drive-sync",
   "google-drive-token.json",
 );
+const DEFAULT_STATE_DIRECTORY = path.dirname(DEFAULT_TOKEN);
 const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+
+interface LocalFile {
+  absolutePath: string;
+  relativePath: string;
+  size: number;
+  modifiedAt: number;
+}
+
+type CheckpointEntry = {
+  fingerprint: string;
+  status: "uploaded" | "skipped";
+};
+
+interface UploadCheckpoint {
+  version: 1;
+  sourceDirectory: string;
+  files: Record<string, CheckpointEntry>;
+}
 
 interface OAuthClientConfig {
   installed?: {
@@ -69,6 +90,7 @@ async function authorize(credentialsPath: string, tokenPath: string): Promise<OA
 
   let auth: OAuth2Client;
   if (savedTokens?.refresh_token) {
+    validateDriveScope(savedTokens, tokenPath);
     auth = new google.auth.OAuth2(
       clientConfig.client_id,
       clientConfig.client_secret,
@@ -81,6 +103,7 @@ async function authorize(credentialsPath: string, tokenPath: string): Promise<OA
       scopes: DRIVE_SCOPES,
       keyfilePath: credentialsPath,
     });
+    validateDriveScope(auth.credentials, tokenPath);
     await saveTokens(tokenPath, auth.credentials);
   }
 
@@ -95,6 +118,19 @@ async function authorize(credentialsPath: string, tokenPath: string): Promise<OA
 
 function escapeDriveQueryValue(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function validateDriveScope(credentials: Credentials, tokenPath: string): void {
+  const driveScopes = (credentials.scope ?? "")
+    .split(/\s+/)
+    .filter((scope) => scope.startsWith("https://www.googleapis.com/auth/drive"));
+  if (driveScopes.length !== 1 || driveScopes[0] !== DRIVE_FILE_SCOPE) {
+    throw new Error(
+      `The Google token at "${tokenPath}" does not confirm the limited Drive file permission. ` +
+        "Revoke this app's access in your Google Account, delete this token file, and run again " +
+        "to authorize with drive.file.",
+    );
+  }
 }
 
 async function findOrCreateFolder(
@@ -142,75 +178,241 @@ async function fileExists(
   return (result.data.files?.length ?? 0) > 0;
 }
 
-async function uploadDirectory(
-  drive: drive_v3.Drive,
-  localDirectory: string,
-  driveFolderId: string,
-  counts: { uploaded: number; skipped: number; failed: number },
-): Promise<void> {
-  const entries = await readdir(localDirectory, { withFileTypes: true });
-  entries.sort((left, right) => left.name.localeCompare(right.name));
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
-  for (const entry of entries) {
-    const localPath = path.join(localDirectory, entry.name);
-    if (entry.isSymbolicLink()) {
-      console.warn(`Skipping symbolic link: ${localPath}`);
-      continue;
-    }
+function getFingerprint(file: LocalFile): string {
+  return `${file.size}:${file.modifiedAt}`;
+}
 
-    if (entry.isDirectory()) {
-      const childFolderId = await findOrCreateFolder(drive, entry.name, driveFolderId);
-      await uploadDirectory(drive, localPath, childFolderId, counts);
-      continue;
-    }
+async function collectSourceTree(
+  sourceDirectory: string,
+): Promise<{ files: LocalFile[]; directories: string[] }> {
+  const files: LocalFile[] = [];
+  const directories = [""];
 
-    if (!entry.isFile()) {
-      continue;
-    }
+  async function visit(directory: string, relativeDirectory: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
 
-    try {
-      if (await fileExists(drive, entry.name, driveFolderId)) {
-        counts.skipped += 1;
-        console.log(`Skipped existing file: ${localPath}`);
-        continue;
+    for (const entry of entries) {
+      const absolutePath = path.join(directory, entry.name);
+      const relativePath = path.join(relativeDirectory, entry.name);
+      if (entry.isSymbolicLink()) {
+        console.warn(`Skipping symbolic link: ${absolutePath}`);
+      } else if (entry.isDirectory()) {
+        directories.push(relativePath);
+        await visit(absolutePath, relativePath);
+      } else if (entry.isFile()) {
+        const fileStat = await stat(absolutePath);
+        files.push({
+          absolutePath,
+          relativePath,
+          size: fileStat.size,
+          modifiedAt: fileStat.mtimeMs,
+        });
       }
-
-      await drive.files.create({
-        requestBody: {
-          name: entry.name,
-          parents: [driveFolderId],
-        },
-        media: {
-          mimeType: "application/octet-stream",
-          body: createReadStream(localPath),
-        },
-        fields: "id",
-      });
-      counts.uploaded += 1;
-      console.log(`Uploaded: ${localPath}`);
-    } catch (error) {
-      counts.failed += 1;
-      console.error(`Failed to upload "${localPath}":`, error);
     }
   }
+
+  await visit(sourceDirectory, "");
+  return { files, directories };
+}
+
+function validateCheckpoint(value: unknown, sourceDirectory: string): UploadCheckpoint {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    value.sourceDirectory !== sourceDirectory ||
+    !isRecord(value.files)
+  ) {
+    throw new Error("The upload checkpoint is invalid or belongs to a different source directory.");
+  }
+
+  const files: Record<string, CheckpointEntry> = {};
+  for (const [relativePath, entry] of Object.entries(value.files)) {
+    if (
+      !isRecord(entry) ||
+      typeof entry.fingerprint !== "string" ||
+      (entry.status !== "uploaded" && entry.status !== "skipped")
+    ) {
+      throw new Error(`Invalid checkpoint entry for "${relativePath}".`);
+    }
+    files[relativePath] = {
+      fingerprint: entry.fingerprint,
+      status: entry.status,
+    };
+  }
+
+  return {
+    version: 1,
+    sourceDirectory,
+    files,
+  };
+}
+
+async function loadCheckpoint(
+  statePath: string,
+  sourceDirectory: string,
+): Promise<UploadCheckpoint> {
+  try {
+    const contents = await readFile(statePath, "utf8");
+    return validateCheckpoint(JSON.parse(contents) as unknown, sourceDirectory);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return { version: 1, sourceDirectory, files: {} };
+    }
+    throw new Error(`Could not load upload checkpoint at "${statePath}".`, { cause: error });
+  }
+}
+
+async function saveCheckpoint(statePath: string, checkpoint: UploadCheckpoint): Promise<void> {
+  await mkdir(path.dirname(statePath), { recursive: true });
+  const temporaryPath = `${statePath}.${process.pid}.tmp`;
+  await writeFile(temporaryPath, JSON.stringify(checkpoint, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(temporaryPath, 0o600);
+  await rename(temporaryPath, statePath);
+}
+
+function printProgress(processed: number, total: number, message: string): void {
+  const percentage = total === 0 ? 100 : Math.floor((processed / total) * 100);
+  console.log(`[${processed}/${total} ${percentage}%] ${message}`);
+}
+
+async function createDriveDirectories(
+  drive: drive_v3.Drive,
+  rootFolderId: string,
+  directories: string[],
+): Promise<Map<string, string>> {
+  const folderIds = new Map<string, string>([["", rootFolderId]]);
+  for (const relativePath of directories) {
+    if (relativePath === "") {
+      continue;
+    }
+
+    const parentPath = path.dirname(relativePath);
+    const parentId = folderIds.get(parentPath === "." ? "" : parentPath);
+    if (!parentId) {
+      throw new Error(`Could not find the Drive parent for "${relativePath}".`);
+    }
+    folderIds.set(
+      relativePath,
+      await findOrCreateFolder(drive, path.basename(relativePath), parentId),
+    );
+  }
+  return folderIds;
+}
+
+async function uploadFiles(
+  drive: drive_v3.Drive,
+  files: LocalFile[],
+  folderIds: Map<string, string>,
+  statePath: string,
+  checkpoint: UploadCheckpoint,
+): Promise<{ uploaded: number; skipped: number; failed: number }> {
+  const counts = { uploaded: 0, skipped: 0, failed: 0 };
+  let processed = Object.keys(checkpoint.files).length;
+  if (processed > 0) {
+    printProgress(processed, files.length, `Resuming; ${processed} files already complete`);
+  } else if (files.length === 0) {
+    printProgress(0, 0, "No files to upload");
+  }
+
+  for (const file of files) {
+    const fingerprint = getFingerprint(file);
+    if (checkpoint.files[file.relativePath]?.fingerprint === fingerprint) {
+      continue;
+    }
+
+    const relativeDirectory = path.dirname(file.relativePath);
+    const driveFolderId = folderIds.get(relativeDirectory === "." ? "" : relativeDirectory);
+    if (!driveFolderId) {
+      throw new Error(`Could not find the Drive folder for "${file.relativePath}".`);
+    }
+
+    let status: CheckpointEntry["status"];
+    try {
+      if (await fileExists(drive, path.basename(file.relativePath), driveFolderId)) {
+        status = "skipped";
+      } else {
+        await drive.files.create({
+          requestBody: {
+            name: path.basename(file.relativePath),
+            parents: [driveFolderId],
+          },
+          media: {
+            mimeType: "application/octet-stream",
+            body: createReadStream(file.absolutePath),
+          },
+          fields: "id",
+        });
+        status = "uploaded";
+      }
+    } catch (error) {
+      counts.failed += 1;
+      processed += 1;
+      printProgress(processed, files.length, `failed; will retry next run: ${file.relativePath}`);
+      console.error(`Failed to process "${file.absolutePath}":`, error);
+      continue;
+    }
+
+    checkpoint.files[file.relativePath] = { fingerprint, status };
+    try {
+      await saveCheckpoint(statePath, checkpoint);
+    } catch (error) {
+      delete checkpoint.files[file.relativePath];
+      throw new Error(`Could not save checkpoint after processing "${file.relativePath}".`, {
+        cause: error,
+      });
+    }
+    counts[status] += 1;
+    processed += 1;
+    printProgress(processed, files.length, `${status}: ${file.relativePath}`);
+  }
+
+  return counts;
 }
 
 async function main(): Promise<void> {
   const sourceDirectory = path.resolve(process.argv[2] ?? DEFAULT_SOURCE);
   const credentialsPath = path.resolve(process.env.GOOGLE_DRIVE_CREDENTIALS ?? DEFAULT_CREDENTIALS);
   const tokenPath = path.resolve(process.env.GOOGLE_DRIVE_TOKEN ?? DEFAULT_TOKEN);
+  const sourceId = createHash("sha256").update(sourceDirectory).digest("hex").slice(0, 16);
+  const statePath = path.resolve(
+    process.env.GOOGLE_DRIVE_STATE ??
+      path.join(DEFAULT_STATE_DIRECTORY, `upload-${sourceId}.json`),
+  );
 
   const sourceStat = await stat(sourceDirectory);
   if (!sourceStat.isDirectory()) {
     throw new Error(`Source path is not a directory: "${sourceDirectory}".`);
   }
 
+  console.log(`Scanning source: ${sourceDirectory}`);
+  const { files, directories } = await collectSourceTree(sourceDirectory);
+  const checkpoint = await loadCheckpoint(statePath, sourceDirectory);
+  const currentFiles = new Map(
+    files.map((file): [string, LocalFile] => [file.relativePath, file]),
+  );
+  for (const [relativePath, entry] of Object.entries(checkpoint.files)) {
+    const currentFile = currentFiles.get(relativePath);
+    if (!currentFile || getFingerprint(currentFile) !== entry.fingerprint) {
+      delete checkpoint.files[relativePath];
+    }
+  }
+  await saveCheckpoint(statePath, checkpoint);
+  console.log(`Found ${files.length} files in ${directories.length} directories.`);
+  console.log(`Checkpoint: ${statePath}`);
+
   const auth = await authorize(credentialsPath, tokenPath);
   const drive = google.drive({ version: "v3", auth });
   const picturesFolderId = await findOrCreateFolder(drive, "Pictures", "root");
-  const counts = { uploaded: 0, skipped: 0, failed: 0 };
-
-  await uploadDirectory(drive, sourceDirectory, picturesFolderId, counts);
+  const folderIds = await createDriveDirectories(drive, picturesFolderId, directories);
+  const counts = await uploadFiles(drive, files, folderIds, statePath, checkpoint);
   console.log(
     `Finished. Uploaded: ${counts.uploaded}; skipped: ${counts.skipped}; failed: ${counts.failed}.`,
   );
